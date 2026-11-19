@@ -1,125 +1,179 @@
-# Prepare the base environment.
-FROM ghcr.io/dbca-wa/docker-apps-dev:ubuntu_2604_base_python AS builder_base_govapp
-LABEL org.opencontainers.image.authors=asi@dbca.wa.gov.au
-LABEL org.opencontainers.image.source=https://github.com/dbca-wa/gokart-sss-django
-SHELL ["/bin/bash", "-c"]
-ENV DEBIAN_FRONTEND=noninteractive
-#ENV DEBUG=True
-ENV TZ=Australia/Perth
-ENV DEFAULT_FROM_EMAIL='no-reply@dbca.wa.gov.au'
-ENV NOTIFICATION_EMAIL='no-reply@dbca.wa.gov.au'
-ENV NON_PROD_EMAIL='none@none.com'
-ENV PRODUCTION_EMAIL=False
-ENV EMAIL_INSTANCE='DEV'
-ENV SECRET_KEY="ThisisNotRealKey"
-ENV SITE_DOMAIN='dbca.wa.gov.au'
+# syntax=docker/dockerfile:1
 
-RUN apt-get clean
-RUN apt-get update
-RUN apt-get upgrade -y
-# RUN apt-get install --no-install-recommends -y curl wget git libmagic-dev gcc binutils libproj-dev gdal-bin python3 python3-setuptools python3-dev python3-pip tzdata cron rsyslog gunicorn
-# RUN apt-get install --no-install-recommends -y libpq-dev patch libreoffice virtualenv
-# RUN apt-get install --no-install-recommends -y postgresql-client mtr htop vim  sudo
-RUN apt-get install --no-install-recommends -y bzip2 pdftk unzip
-# RUN apt-get install --no-install-recommends -y software-properties-common
-# RUN apt-get install --no-install-recommends -y run-one
-# RUN ln -s /usr/bin/python3 /usr/bin/python
+ARG BASE_IMAGE=ghcr.io/dbca-wa/docker-apps-dev:ubuntu_2604_base_python_node26
 
-# Install GDAL
-# RUN add-apt-repository ppa:ubuntugis/ubuntugis-unstable
-# RUN apt update
-# RUN apt-get install --no-install-recommends -y gdal-bin python3-gdal
-# RUN apt-get install --no-install-recommends -y libgdal-dev build-essential
+# ----------------------------------------------------------------------
+# Builder
+# ----------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS builder
 
+LABEL maintainer="asi@dbca.wa.gov.au"
+LABEL org.opencontainers.image.source="https://github.com/dbca-wa/gokart-sss-django"
 
-# Install nodejs
-RUN update-ca-certificates
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Australia/Perth \
+    DEFAULT_FROM_EMAIL=no-reply@dbca.wa.gov.au \
+    NOTIFICATION_EMAIL=no-reply@dbca.wa.gov.au \
+    NON_PROD_EMAIL=none@none.com \
+    PRODUCTION_EMAIL=False \
+    EMAIL_INSTANCE=DEV \
+    SECRET_KEY="ThisisNotRealKey" \
+    SITE_DOMAIN=dbca.wa.gov.au
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+        bzip2 \
+        pdftk \
+        unzip && \
+    update-ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 5000 oim && \
+    useradd -g 5000 -u 5000 oim -s /bin/bash -d /app && \
+    mkdir /app && \
+    chown -R oim:oim /app
+
+WORKDIR /app
+USER oim
+
+ENV VIRTUAL_ENV=/app/venv
+ENV PATH=$VIRTUAL_ENV/bin:$PATH
+
+# ----------------------------------------------------------------------
+# Python dependencies (cached separately from source changes)
+# ----------------------------------------------------------------------
+
+COPY --chown=oim:oim requirements.txt ./
+
+RUN python3 -m venv $VIRTUAL_ENV && \
+    $VIRTUAL_ENV/bin/pip install --upgrade pip && \
+    $VIRTUAL_ENV/bin/uv pip install -r requirements.txt
+
+# ----------------------------------------------------------------------
+# Frontend dependencies (cached separately from frontend source changes)
+# ----------------------------------------------------------------------
+
+COPY --chown=oim:oim \
+    sss/frontend/sss/package*.json \
+    /app/sss/frontend/sss/
+
+WORKDIR /app/sss/frontend/sss
+
+RUN npm ci
+
+# ----------------------------------------------------------------------
+# Application source
+# ----------------------------------------------------------------------
 
 WORKDIR /app
 
-# install node 16
-RUN touch install_node.sh
-RUN curl -fsSL https://deb.nodesource.com/setup_18.x -o install_node.sh
-RUN chmod +x install_node.sh && ./install_node.sh
-RUN apt-get update
-RUN apt-get install -y nodejs
-RUN apt-get install -y uglifyjs
-RUN npm install -g browserify
-RUN npm install -g npm-run-all
-RUN npm install -g closure-util
+COPY --chown=oim:oim gunicorn.ini ./
+COPY --chown=oim:oim manage.py ./
+COPY --chown=oim:oim uwsgi_prod.ini ./
+COPY --chown=oim:oim profile.py ./
 
-# Install nodejs
-COPY python-cron python-cron
-COPY startup.sh pre_startup.sh /
-COPY ./timezone /etc/timezone
-COPY sss sss
-COPY packages packages
-RUN chmod 755 /startup.sh && \
-    chmod +s /startup.sh && \
-    chmod 755 /pre_startup.sh && \
-    chmod +s /pre_startup.sh && \
-    groupadd -g 5000 oim && \
-    useradd -g 5000 -u 5000 oim -s /bin/bash -d /app && \    
-    chown -R oim.oim /app && \
-    mkdir /container-config/ && \
-    chown -R oim.oim /container-config/ && \
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
-    touch /app/rand_hash
+COPY --chown=oim:oim python-cron ./python-cron
+COPY --chown=oim:oim packages ./packages
+COPY --chown=oim:oim sss ./sss
 
-# Default Scripts
-RUN wget https://raw.githubusercontent.com/dbca-wa/wagov_utils/main/wagov_utils/bin/default_script_installer.sh -O /tmp/default_script_installer.sh
-RUN chmod 755 /tmp/default_script_installer.sh
-RUN /tmp/default_script_installer.sh
+# ----------------------------------------------------------------------
+# Build Vue frontend
+# ----------------------------------------------------------------------
 
-RUN chmod 755 /pre_startup.sh
-# Install Python libs from requirements.txt.
-FROM builder_base_govapp AS python_libs_govapp
+WORKDIR /app/sss/frontend/sss
+
+RUN npm run build && \
+    rm -rf node_modules
+
+# ----------------------------------------------------------------------
+# Django static build
+# ----------------------------------------------------------------------
+
+WORKDIR /app
+
+RUN touch /app/.env && \
+    $VIRTUAL_ENV/bin/python manage.py collectstatic --noinput
+
+# ----------------------------------------------------------------------
+# Runtime
+# ----------------------------------------------------------------------
+
+FROM ${BASE_IMAGE} AS runtime
+
+ARG IMAGE_TAG
+ARG IMAGE_NAME
+
+LABEL maintainer="asi@dbca.wa.gov.au"
+LABEL org.opencontainers.image.source="https://github.com/dbca-wa/gokart-sss-django"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Australia/Perth \
+    DEFAULT_FROM_EMAIL=no-reply@dbca.wa.gov.au \
+    NOTIFICATION_EMAIL=no-reply@dbca.wa.gov.au \
+    NON_PROD_EMAIL=none@none.com \
+    PRODUCTION_EMAIL=False \
+    EMAIL_INSTANCE=DEV \
+    SECRET_KEY="ThisisNotRealKey" \
+    SITE_DOMAIN=dbca.wa.gov.au \
+    CONTAINER_IMAGE_TAG=${IMAGE_TAG} \
+    CONTAINER_IMAGE_NAME=${IMAGE_NAME}
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+        bzip2 \
+        pdftk \
+        unzip \
+        wget && \
+    update-ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 5000 oim && \
+    useradd -g 5000 -u 5000 oim -s /bin/bash -d /app && \
+    mkdir -p /app/tmp /app/logs /container-config && \
+    chown -R oim:oim /app /container-config && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone
+
+COPY startup.sh /
+COPY pre_startup.sh /
+
+RUN chmod 755 /startup.sh /pre_startup.sh
 
 USER oim
+WORKDIR /app
+
 ENV VIRTUAL_ENV=/app/venv
-RUN python -m venv $VIRTUAL_ENV
+ENV PATH=$VIRTUAL_ENV/bin:$PATH
 
-ENV PATH=/app/venv/bin:$PATH
+COPY --from=builder --chown=oim:oim /app/venv /app/venv
+COPY --from=builder --chown=oim:oim /app/sss /app/sss
+COPY --from=builder --chown=oim:oim /app/packages /app/packages
+COPY --from=builder --chown=oim:oim /app/python-cron /app/python-cron
+COPY --from=builder --chown=oim:oim /app/staticfiles /app/staticfiles
 
+COPY --from=builder --chown=oim:oim /app/.env /app/.env
+COPY --from=builder --chown=oim:oim /app/gunicorn.ini /app/gunicorn.ini
+COPY --from=builder --chown=oim:oim /app/manage.py /app/manage.py
+COPY --from=builder --chown=oim:oim /app/uwsgi_prod.ini /app/uwsgi_prod.ini
 
-
-RUN whereis python
-COPY --chown=oim:oim requirements.txt ./
-COPY --chown=oim:oim src src
-COPY --chown=oim:oim .git .git
-COPY --chown=oim:oim package.json ./
-# COPY --chown=oim:oim package-lock.json ./
-COPY --chown=oim:oim profile.py ./
-RUN pip install --upgrade pip
-RUN uv pip install -r requirements.txt
-RUN pip install npm
-#\ && rm -rf /var/lib/{apt,dpkg,cache,log}/ /tmp/* /var/tmp/*
-
-RUN npm install --loglevel verbose
-RUN npm run build
-
-# Install the project (ensure that frontend projects have been built prior to this step).
-FROM python_libs_govapp
-COPY --chown=oim:oim gunicorn.ini manage.py uwsgi_prod.ini ./
-RUN touch /app/.env
-
-RUN python manage.py collectstatic --noinput
-
-RUN mkdir /app/tmp/
-RUN chmod 777 /app/tmp/
-
-# IPYTHONDIR - Will allow shell_plus (in Docker) to remember history between sessions
-# 1. will create dir, if it does not already exist
-# 2. will create profile, if it does not already exist
-#RUN mkdir /app/logs/.ipython
-#RUN export IPYTHONDIR=/app/logs/.ipython/
+# ----------------------------------------------------------------------
 # Cleanup
-# USER root
-# RUN wget https://raw.githubusercontent.com/dbca-wa/wagov_utils/refs/heads/main/wagov_utils/bin/package_cleanup_2604.sh -O /tmp/package_cleanup_2604.sh
-# RUN chmod 755 /tmp/package_cleanup_2604.sh
-# RUN /tmp/package_cleanup_2604.sh
-# USER oim
+# ----------------------------------------------------------------------
+
+USER root
+
+RUN wget https://raw.githubusercontent.com/dbca-wa/wagov_utils/refs/heads/main/wagov_utils/bin/package_cleanup_2604.sh \
+        -O /tmp/package_cleanup_2604.sh && \
+    chmod 755 /tmp/package_cleanup_2604.sh && \
+    /tmp/package_cleanup_2604.sh
+
+USER oim
 
 EXPOSE 8080
-HEALTHCHECK --interval=1m --timeout=5s --start-period=10s --retries=3 CMD ["wget", "-q", "-O", "-", "http://localhost:8080/"]
-CMD ["/bin/bash", "-c", "/startup.sh"]
+
+HEALTHCHECK --interval=1m --timeout=5s --start-period=10s --retries=3 \
+    CMD ["wget", "-q", "-O", "-", "http://localhost:8080/"]
+
+CMD ["/startup.sh"]
